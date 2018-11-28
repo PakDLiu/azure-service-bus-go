@@ -45,7 +45,7 @@ func (e *entity) RenewLocks(ctx context.Context, messages []*Message) error {
 	}
 
 	entityManagementAddress := e.ManagementPath()
-	conn, err := e.namespace.newConnection()
+	conn, err := e.namespace.connection()
 	if err != nil {
 		return err
 	}

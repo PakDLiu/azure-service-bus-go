@@ -3,6 +3,7 @@ package servicebus
 import (
 	"context"
 	"fmt"
+	"github.com/stretchr/testify/require"
 	"math/rand"
 	"testing"
 	"time"
@@ -60,12 +61,14 @@ func testQueueSendAndReceiveWithRenewLock(ctx context.Context, t *testing.T, que
 			numSeen++
 			seen[string(msg.Data)]++
 
+			fmt.Println("received: ", string(msg.Data))
 			activeMessages = append(activeMessages, msg)
 			if numSeen >= numMessages {
 				cancel()
 			}
-			return func(ctx context.Context) {
+			return func(ctx context.Context) error {
 				//Do nothing as we want the message to remain in an uncompleted state.
+				return nil
 			}
 		}))
 	}()
@@ -82,7 +85,7 @@ func testQueueSendAndReceiveWithRenewLock(ctx context.Context, t *testing.T, que
 			// If a renewal is taking place when the test ends
 			// it will fail and cause a panic without this check
 			if err != nil && runRenewal {
-				t.Error(err)
+				require.NoError(t, err)
 			}
 		}
 	}()
@@ -93,10 +96,11 @@ func testQueueSendAndReceiveWithRenewLock(ctx context.Context, t *testing.T, que
 		expected[payload]++
 		msg := NewMessageFromString(payload)
 		msg.TTL = &ttl
+		fmt.Println("sending: ", string(msg.Data))
 		assert.NoError(t, queue.Send(ctx, msg))
 	}
 
-	// Wait for the all the messages to be send and recieved.
+	// Wait for the all the messages to be send and received.
 	// The renewal loop should keep locks live on the messages during this wait
 	time.Sleep(processingTime)
 	runRenewal = false
@@ -106,7 +110,7 @@ func testQueueSendAndReceiveWithRenewLock(ctx context.Context, t *testing.T, que
 		msg.Complete()(ctx)
 	}
 
-	//Check for any errors
+	// Check for any errors
 	assert.EqualError(t, <-errs, context.Canceled.Error())
 
 	assert.Equal(t, len(expected), len(seen))

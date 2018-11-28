@@ -25,7 +25,6 @@ package servicebus
 import (
 	"context"
 	"encoding/xml"
-	"sync"
 
 	"github.com/Azure/azure-amqp-common-go/log"
 	"github.com/Azure/go-autorest/autorest/date"
@@ -38,10 +37,7 @@ type (
 	Subscription struct {
 		*entity
 		Topic             *Topic
-		receiver          *receiver
-		receiverMu        sync.Mutex
 		receiveMode       ReceiveMode
-		requiredSessionID *string
 	}
 
 	// SubscriptionDescription is the content type for Subscription management requests
@@ -105,17 +101,17 @@ func (t *Topic) NewSubscription(name string, opts ...SubscriptionOption) (*Subsc
 // unable to complete the operation, or an empty slice of messages and an instance of "ErrNoMessages" signifying that
 // there are currently no messages in the subscription with a sequence ID larger than previously viewed ones.
 func (s *Subscription) Peek(ctx context.Context, options ...PeekOption) (MessageIterator, error) {
-	err := s.ensureReceiver(ctx)
+	c, err := s.namespace.connection()
 	if err != nil {
 		return nil, err
 	}
 
-	return newPeekIterator(s.entity, s.receiver.connection, options...)
+	return newPeekIterator(s.entity, c, options...)
 }
 
 // PeekOne fetches a single Message from the Service Bus broker without acquiring a lock or committing to a disposition.
 func (s *Subscription) PeekOne(ctx context.Context, options ...PeekOption) (*Message, error) {
-	err := s.ensureReceiver(ctx)
+	c, err := s.namespace.connection()
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +122,7 @@ func (s *Subscription) PeekOne(ctx context.Context, options ...PeekOption) (*Mes
 	//   be unread.
 	options = append(options, PeekWithPageSize(1))
 
-	it, err := newPeekIterator(s.entity, s.receiver.connection, options...)
+	it, err := newPeekIterator(s.entity, c, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -138,11 +134,13 @@ func (s *Subscription) ReceiveOne(ctx context.Context, handler Handler) error {
 	span, ctx := s.startSpanFromContext(ctx, "sb.Subscription.ReceiveOne")
 	defer span.Finish()
 
-	if err := s.ensureReceiver(ctx); err != nil {
+	r, err := s.newReceiver(ctx)
+	if err != nil {
 		return err
 	}
+	defer closeLink(ctx, r)
 
-	return s.receiver.ReceiveOne(ctx, handler)
+	return r.ReceiveOne(ctx, handler)
 }
 
 // Receive subscribes for messages sent to the Subscription
@@ -150,10 +148,13 @@ func (s *Subscription) Receive(ctx context.Context, handler Handler) error {
 	span, ctx := s.startSpanFromContext(ctx, "sb.Subscription.Receive")
 	defer span.Finish()
 
-	if err := s.ensureReceiver(ctx); err != nil {
+	r, err := s.newReceiver(ctx)
+	if err != nil {
 		return err
 	}
-	handle := s.receiver.Listen(ctx, handler)
+	defer closeLink(ctx, r)
+
+	handle := r.Listen(ctx, handler)
 	<-handle.Done()
 	return handle.Err()
 }
@@ -166,16 +167,13 @@ func (s *Subscription) ReceiveOneSession(ctx context.Context, sessionID *string,
 	span, ctx := s.startSpanFromContext(ctx, "sb.Subscription.ReceiveOneSession")
 	defer span.Finish()
 
-	options := make([]receiverOption, 0, 1)
-	if sessionID != nil {
-		options = append(options, receiverWithSession(sessionID))
-	}
-	s.requiredSessionID = sessionID
-	if err := s.ensureReceiver(ctx, options...); err != nil {
+	r, err := s.newReceiver(ctx, receiverWithSession(sessionID))
+	if err != nil {
 		return err
 	}
+	defer closeLink(ctx, r)
 
-	ms, err := newMessageSession(s.receiver, s.entity, sessionID)
+	ms, err := newMessageSession(r, s.entity, sessionID)
 	if err != nil {
 		return err
 	}
@@ -186,7 +184,7 @@ func (s *Subscription) ReceiveOneSession(ctx context.Context, sessionID *string,
 	}
 
 	defer handler.End()
-	handle := s.receiver.Listen(ctx, handler)
+	handle := r.Listen(ctx, handler)
 
 	select {
 	case <-handle.Done():
@@ -196,29 +194,17 @@ func (s *Subscription) ReceiveOneSession(ctx context.Context, sessionID *string,
 	}
 }
 
-func (s *Subscription) ensureReceiver(ctx context.Context, options ...receiverOption) error {
-	span, ctx := s.startSpanFromContext(ctx, "sb.Queue.ensureReceiver")
+func (s *Subscription) newReceiver(ctx context.Context, options ...receiverOption) (*receiver, error) {
+	span, ctx := s.startSpanFromContext(ctx, "sb.Subscription.newReceiver")
 	defer span.Finish()
-
-	s.receiverMu.Lock()
-	defer s.receiverMu.Unlock()
 
 	options = append(options, receiverWithReceiveMode(s.receiveMode))
 
-	receiver, err := s.namespace.newReceiver(ctx, s.Topic.Name+"/Subscriptions/"+s.Name, options...)
+	r, err := s.namespace.newReceiver(ctx, s.Topic.Name+"/Subscriptions/"+s.Name, options...)
 	if err != nil {
 		log.For(ctx).Error(err)
-		return err
+		return r, err
 	}
 
-	s.receiver = receiver
-	return nil
-}
-
-// Close the underlying connection to Service Bus
-func (s *Subscription) Close(ctx context.Context) error {
-	if s.receiver != nil {
-		return s.receiver.Close(ctx)
-	}
-	return nil
+	return r, nil
 }

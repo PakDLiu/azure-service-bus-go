@@ -51,8 +51,6 @@ type (
 	Queue struct {
 		*entity
 		sender            *sender
-		receiver          *receiver
-		receiverMu        sync.Mutex
 		senderMu          sync.Mutex
 		receiveMode       ReceiveMode
 		requiredSessionID *string
@@ -96,6 +94,10 @@ type (
 
 	// ReceiveMode represents the behavior when consuming a message from a queue
 	ReceiveMode int
+
+	closer interface {
+		Close(context.Context) error
+	}
 )
 
 const (
@@ -298,17 +300,17 @@ func (q *Queue) CancelScheduled(ctx context.Context, seq ...int64) error {
 // unable to complete the operation, or an empty slice of messages and an instance of "ErrNoMessages" signifying that
 // there are currently no messages in the queue with a sequence ID larger than previously viewed ones.
 func (q *Queue) Peek(ctx context.Context, options ...PeekOption) (MessageIterator, error) {
-	err := q.ensureReceiver(ctx)
+	c, err := q.namespace.connection()
 	if err != nil {
 		return nil, err
 	}
 
-	return newPeekIterator(q.entity, q.receiver.connection, options...)
+	return newPeekIterator(q.entity, c, options...)
 }
 
 // PeekOne fetches a single Message from the Service Bus broker without acquiring a lock or committing to a disposition.
 func (q *Queue) PeekOne(ctx context.Context, options ...PeekOption) (*Message, error) {
-	err := q.ensureReceiver(ctx)
+	c, err := q.namespace.connection()
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +321,7 @@ func (q *Queue) PeekOne(ctx context.Context, options ...PeekOption) (*Message, e
 	//   be unread.
 	options = append(options, PeekWithPageSize(1))
 
-	it, err := newPeekIterator(q.entity, q.receiver.connection, options...)
+	it, err := newPeekIterator(q.entity, c, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -331,11 +333,13 @@ func (q *Queue) ReceiveOne(ctx context.Context, handler Handler) error {
 	span, ctx := q.startSpanFromContext(ctx, "sb.Queue.ReceiveOne")
 	defer span.Finish()
 
-	if err := q.ensureReceiver(ctx); err != nil {
+	r, err := q.newReceiver(ctx)
+	if err != nil {
 		return err
 	}
+	defer closeLink(ctx, r)
 
-	return q.receiver.ReceiveOne(ctx, handler)
+	return r.ReceiveOne(ctx, handler)
 }
 
 // Receive subscribes for messages sent to the Queue. If the messages not within a session, messages will arrive
@@ -344,12 +348,13 @@ func (q *Queue) Receive(ctx context.Context, handler Handler) error {
 	span, ctx := q.startSpanFromContext(ctx, "sb.Queue.Receive")
 	defer span.Finish()
 
-	err := q.ensureReceiver(ctx)
+	r, err := q.newReceiver(ctx)
 	if err != nil {
 		return err
 	}
+	defer closeLink(ctx, r)
 
-	handle := q.receiver.Listen(ctx, handler)
+	handle := r.Listen(ctx, handler)
 	<-handle.Done()
 	return handle.Err()
 }
@@ -363,13 +368,13 @@ func (q *Queue) ReceiveOneSession(ctx context.Context, sessionID *string, handle
 	span, ctx := q.startSpanFromContext(ctx, "sb.Queue.ReceiveOneSession")
 	defer span.Finish()
 
-	// Establish a receiver that reads a particular session.
-	q.requiredSessionID = sessionID
-	if err := q.ensureReceiver(ctx, receiverWithSession(sessionID)); err != nil {
+	r, err := q.newReceiver(ctx, receiverWithSession(sessionID))
+	if err != nil {
 		return err
 	}
+	defer closeLink(ctx, r)
 
-	ms, err := newMessageSession(q.receiver, q.entity, sessionID)
+	ms, err := newMessageSession(r, q.entity, sessionID)
 	if err != nil {
 		return err
 	}
@@ -380,7 +385,7 @@ func (q *Queue) ReceiveOneSession(ctx context.Context, sessionID *string, handle
 	}
 
 	defer handler.End()
-	handle := q.receiver.Listen(ctx, handler)
+	handle := r.Listen(ctx, handler)
 
 	select {
 	case <-handle.Done():
@@ -403,42 +408,24 @@ func (q *Queue) ReceiveSessions(ctx context.Context, handler SessionHandler) err
 	}
 }
 
-func (q *Queue) ensureReceiver(ctx context.Context, opts ...receiverOption) error {
-	span, ctx := q.startSpanFromContext(ctx, "sb.Queue.ensureReceiver")
+func (q *Queue) newReceiver(ctx context.Context, opts ...receiverOption) (*receiver, error) {
+	span, ctx := q.startSpanFromContext(ctx, "sb.Queue.newReceiver")
 	defer span.Finish()
 
-	q.receiverMu.Lock()
-	defer q.receiverMu.Unlock()
-
-	// TODO: this is where the receiver connection is leaked -- fix me.
-	//if q.receiver != nil {
-	//	return nil
-	//}
-
 	opts = append(opts, receiverWithReceiveMode(q.receiveMode))
-
-	receiver, err := q.namespace.newReceiver(ctx, q.Name, opts...)
+	r, err := q.namespace.newReceiver(ctx, q.Name, opts...)
 	if err != nil {
 		log.For(ctx).Error(err)
-		return err
+		return r, err
 	}
 
-	q.receiver = receiver
-	return nil
+	return r, nil
 }
 
 // Close the underlying connection to Service Bus
 func (q *Queue) Close(ctx context.Context) error {
 	span, ctx := q.startSpanFromContext(ctx, "sb.Queue.Close")
 	defer span.Finish()
-
-	if q.receiver != nil {
-		if err := q.receiver.Close(ctx); err != nil {
-			_ = q.sender.Close(ctx)
-			log.For(ctx).Error(err)
-			return err
-		}
-	}
 
 	if q.sender != nil {
 		return q.sender.Close(ctx)
@@ -454,13 +441,8 @@ func (q *Queue) ensureSender(ctx context.Context) error {
 	q.senderMu.Lock()
 	defer q.senderMu.Unlock()
 
-	var opts []senderOption
-	if q.requiredSessionID != nil {
-		opts = append(opts, sendWithSession(*q.requiredSessionID))
-	}
-
 	if q.sender == nil {
-		s, err := q.namespace.newSender(ctx, q.Name, opts...)
+		s, err := q.namespace.newSender(ctx, q.Name)
 		if err != nil {
 			log.For(ctx).Error(err)
 			return err
@@ -468,6 +450,13 @@ func (q *Queue) ensureSender(ctx context.Context) error {
 		q.sender = s
 	}
 	return nil
+}
+
+func closeLink(ctx context.Context, c closer) {
+	err := c.Close(ctx)
+	if err != nil {
+		log.For(ctx).Error(err)
+	}
 }
 
 func (e *entity) ManagementPath() string {

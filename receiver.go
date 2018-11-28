@@ -88,7 +88,12 @@ func (r *receiver) Close(ctx context.Context) error {
 		r.done()
 	}
 
-	return r.connection.Close()
+	err := r.receiver.Close(ctx)
+	if err != nil {
+		_ = r.session.Close(ctx)
+		return err
+	}
+	return r.session.Close(ctx)
 }
 
 // Recover will attempt to close the current session and link, then rebuild them
@@ -116,9 +121,7 @@ func (r *receiver) ReceiveOne(ctx context.Context, handler Handler) error {
 		return err
 	}
 
-	r.handleMessage(ctx, amqpMsg, handler)
-
-	return nil
+	return r.handleMessage(ctx, amqpMsg, handler)
 }
 
 // Listen start a listener for messages sent to the entity path
@@ -147,12 +150,17 @@ func (r *receiver) handleMessages(ctx context.Context, messages chan *amqp.Messa
 		case <-ctx.Done():
 			return
 		case msg := <-messages:
-			r.handleMessage(ctx, msg, handler)
+			if err := r.handleMessage(ctx, msg, handler); err != nil {
+				log.For(ctx).Error(err)
+				r.lastError = err
+				r.done()
+				return
+			}
 		}
 	}
 }
 
-func (r *receiver) handleMessage(ctx context.Context, msg *amqp.Message, handler Handler) {
+func (r *receiver) handleMessage(ctx context.Context, msg *amqp.Message, handler Handler) error {
 	const optName = "sb.receiver.handleMessage"
 	event, err := messageFromAMQPMessage(msg)
 	if err != nil {
@@ -174,14 +182,14 @@ func (r *receiver) handleMessage(ctx context.Context, msg *amqp.Message, handler
 	dispositionAction := handler.Handle(ctx, event)
 
 	if r.mode == ReceiveAndDeleteMode {
-		return
+		return nil
 	}
 
 	if dispositionAction != nil {
-		dispositionAction(ctx)
+		return dispositionAction(ctx)
 	} else {
 		log.For(ctx).Info(fmt.Sprintf("disposition action not provided auto accepted message id %q", id))
-		event.Complete()
+		return event.Complete()(ctx)
 	}
 }
 
@@ -251,7 +259,7 @@ func (r *receiver) listenForMessage(ctx context.Context) (*amqp.Message, error) 
 
 // newSessionAndLink will replace the session and link on the receiver
 func (r *receiver) newSessionAndLink(ctx context.Context) error {
-	connection, err := r.namespace.newConnection()
+	connection, err := r.namespace.connection()
 	if err != nil {
 		return err
 	}

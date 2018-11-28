@@ -93,7 +93,6 @@ func (s *sender) Recover(ctx context.Context) error {
 	defer cancel()
 	_ = s.sender.Close(closeCtx)
 	_ = s.session.Close(closeCtx)
-	_ = s.connection.Close()
 	return s.newSessionAndLink(ctx)
 }
 
@@ -102,7 +101,12 @@ func (s *sender) Close(ctx context.Context) error {
 	span, _ := s.startProducerSpanFromContext(ctx, "sb.sender.Close")
 	defer span.Finish()
 
-	return s.connection.Close()
+	err := s.sender.Close(ctx)
+	if err != nil {
+		_ = s.session.Close(ctx)
+		return err
+	}
+	return s.session.Close(ctx)
 }
 
 // Send will send a message to the entity path with options
@@ -201,7 +205,7 @@ func (s *sender) newSessionAndLink(ctx context.Context) error {
 	span, ctx := s.startProducerSpanFromContext(ctx, "sb.sender.newSessionAndLink")
 	defer span.Finish()
 
-	connection, err := s.namespace.newConnection()
+	connection, err := s.namespace.connection()
 	if err != nil {
 		log.For(ctx).Error(err)
 		return err

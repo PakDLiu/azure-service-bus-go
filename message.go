@@ -56,7 +56,7 @@ type (
 	}
 
 	// DispositionAction represents the action to notify Azure Service Bus of the Message's disposition
-	DispositionAction func(ctx context.Context)
+	DispositionAction func(ctx context.Context) error
 
 	// MessageErrorCondition represents a well-known collection of AMQP errors
 	MessageErrorCondition string
@@ -114,21 +114,21 @@ func NewMessage(data []byte) *Message {
 
 // Complete will notify Azure Service Bus that the message was successfully handled and should be deleted from the queue
 func (m *Message) Complete() DispositionAction {
-	return func(ctx context.Context) {
+	return func(ctx context.Context) error {
 		span, _ := m.startSpanFromContext(ctx, "sb.Message.Complete")
 		defer span.Finish()
 
-		m.message.Accept()
+		return m.message.Accept()
 	}
 }
 
 // Abandon will notify Azure Service Bus the message failed but should be re-queued for delivery.
 func (m *Message) Abandon() DispositionAction {
-	return func(ctx context.Context) {
+	return func(ctx context.Context) error {
 		span, _ := m.startSpanFromContext(ctx, "sb.Message.Abandon")
 		defer span.Finish()
 
-		m.message.Modify(false, false, nil)
+		return m.message.Modify(false, false, nil)
 	}
 }
 
@@ -156,7 +156,7 @@ func (m *Message) Abandon() DispositionAction {
 
 // DeadLetter will notify Azure Service Bus the message failed and should not re-queued
 func (m *Message) DeadLetter(err error) DispositionAction {
-	return func(ctx context.Context) {
+	return func(ctx context.Context) error {
 		span, _ := m.startSpanFromContext(ctx, "sb.Message.DeadLetter")
 		defer span.Finish()
 
@@ -164,7 +164,7 @@ func (m *Message) DeadLetter(err error) DispositionAction {
 			Condition:   amqp.ErrorCondition(ErrorInternalError),
 			Description: err.Error(),
 		}
-		m.message.Reject(&amqpErr)
+		return m.message.Reject(&amqpErr)
 	}
 }
 
@@ -179,7 +179,7 @@ func (m *Message) DeadLetterWithInfo(err error, condition MessageErrorCondition,
 		}
 	}
 
-	return func(ctx context.Context) {
+	return func(ctx context.Context) error {
 		span, _ := m.startSpanFromContext(ctx, "sb.Message.DeadLetterWithInfo")
 		defer span.Finish()
 
@@ -188,7 +188,7 @@ func (m *Message) DeadLetterWithInfo(err error, condition MessageErrorCondition,
 			Description: err.Error(),
 			Info:        info,
 		}
-		m.message.Reject(&amqpErr)
+		return m.message.Reject(&amqpErr)
 	}
 }
 

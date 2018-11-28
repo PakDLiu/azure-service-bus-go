@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 
 	"github.com/Azure/azure-amqp-common-go/auth"
 	"github.com/Azure/azure-amqp-common-go/cbs"
@@ -60,6 +61,8 @@ type (
 		Name          string
 		TokenProvider auth.TokenProvider
 		Environment   azure.Environment
+		connMu        sync.Mutex
+		conn          *amqp.Client
 	}
 
 	// NamespaceOption provides structure for configuring a new Service Bus namespace
@@ -101,9 +104,14 @@ func NewNamespace(opts ...NamespaceOption) (*Namespace, error) {
 	return ns, nil
 }
 
-func (ns *Namespace) newConnection() (*amqp.Client, error) {
+// connection builds a new AMQP client which builds a tcp connection to the broker if the client has not yet been built.
+func (ns *Namespace) connection() (*amqp.Client, error) {
+	if ns.conn != nil {
+		return ns.conn, nil
+	}
+
 	host := ns.getAMQPHostURI()
-	return amqp.Dial(host,
+	c, err := amqp.Dial(host,
 		amqp.ConnSASLAnonymous(),
 		amqp.ConnMaxSessions(65535),
 		amqp.ConnProperty("product", "MSGolangClient"),
@@ -112,6 +120,8 @@ func (ns *Namespace) newConnection() (*amqp.Client, error) {
 		amqp.ConnProperty("framework", runtime.Version()),
 		amqp.ConnProperty("user-agent", rootUserAgent),
 	)
+	ns.conn = c
+	return ns.conn, err
 }
 
 func (ns *Namespace) negotiateClaim(ctx context.Context, conn *amqp.Client, entityPath string) error {
