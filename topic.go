@@ -95,8 +95,8 @@ func (ns *Namespace) NewTopic(name string, opts ...TopicOption) (*Topic, error) 
 
 // Send sends messages to the Topic
 func (t *Topic) Send(ctx context.Context, event *Message, opts ...SendOption) error {
-	span, ctx := t.startSpanFromContext(ctx, "sb.Topic.Send")
-	defer span.Finish()
+	ctx, span := t.startSpanFromContext(ctx, "sb.Topic.Send")
+	defer span.End()
 
 	err := t.ensureSender(ctx)
 	if err != nil {
@@ -123,8 +123,8 @@ func (t *Topic) NewSender(ctx context.Context, opts ...SenderOption) (*Sender, e
 
 // Close the underlying connection to Service Bus
 func (t *Topic) Close(ctx context.Context) error {
-	span, ctx := t.startSpanFromContext(ctx, "sb.Topic.Close")
-	defer span.Finish()
+	ctx, span := t.startSpanFromContext(ctx, "sb.Topic.Close")
+	defer span.End()
 
 	if t.sender != nil {
 		return t.sender.Close(ctx)
@@ -150,16 +150,16 @@ func (t *Topic) NewTransferDeadLetter() *TransferDeadLetter {
 //   - The destination queue or topic is disabled or deleted.
 //   - The destination queue or topic exceeds the maximum entity size.
 func (t *Topic) NewTransferDeadLetterReceiver(ctx context.Context, opts ...ReceiverOption) (ReceiveOner, error) {
-	span, ctx := t.startSpanFromContext(ctx, "sb.Topic.NewTransferDeadLetterReceiver")
-	defer span.Finish()
+	ctx, span := t.startSpanFromContext(ctx, "sb.Topic.NewTransferDeadLetterReceiver")
+	defer span.End()
 
 	transferDeadLetterEntityPath := strings.Join([]string{t.Name, TransferDeadLetterQueueName}, "/")
 	return t.namespace.NewReceiver(ctx, transferDeadLetterEntityPath, opts...)
 }
 
 func (t *Topic) ensureSender(ctx context.Context) error {
-	span, ctx := t.startSpanFromContext(ctx, "sb.Topic.ensureSender")
-	defer span.Finish()
+	ctx, span := t.startSpanFromContext(ctx, "sb.Topic.ensureSender")
+	defer span.End()
 
 	t.senderMu.Lock()
 	defer t.senderMu.Unlock()
